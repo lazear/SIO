@@ -1,7 +1,8 @@
 from enum import Enum
 from collections import defaultdict
+from typing import List, Dict
 
-TokenKind = Enum('TokenKind', 'IF THEN ELSE IDENT INT OPERATOR PRINT STRING VAR ASSIGN UNKNOWN EOF ENDLN OPEN METHOD BLOCKEND EQ INPUT DIV MUL MINUS PLUS LPAREN RPAREN FUNC RUN')
+TokenKind = Enum('TokenKind', 'IF THEN ELSE IDENT INT OPERATOR PRINT STRING VAR ASSIGN UNKNOWN EOF ENDLN OPEN METHOD BLOCKEND EQ INPUT DIV MUL MINUS PLUS LPAREN RPAREN FUNC RUN COMMA')
 
 class Token:    
     def __init__(self, kind: TokenKind, data):
@@ -21,6 +22,8 @@ class Lexer:
         self.kws['if'] = TokenKind.IF
         self.kws['{'] = TokenKind.THEN
         self.kws['}'] = TokenKind.BLOCKEND
+        self.kws['('] = TokenKind.LPAREN 
+        self.kws[')'] = TokenKind.RPAREN
         self.kws['else'] = TokenKind.ELSE
         self.kws['+'] = TokenKind.PLUS
         self.kws['-'] = TokenKind.MINUS
@@ -32,6 +35,7 @@ class Lexer:
         self.kws['open'] = TokenKind.OPEN
         self.kws['r'] = TokenKind.METHOD
         self.kws[';'] = TokenKind.ENDLN
+        self.kws[','] = TokenKind.COMMA
         self.kws['='] = TokenKind.ASSIGN
         self.kws['=='] = TokenKind.EQ
         self.kws['input'] = TokenKind.INPUT
@@ -104,7 +108,9 @@ class AST:
     pass 
 
 class State:
-    vals = {}
+    # vals = {}
+    def __init__(self):
+        self.vals = dict()
     def bind(self, name, val):
         self.vals[name] = val
     def lookup(self, name):
@@ -159,24 +165,52 @@ class Print(AST):
             return None
 
 class FunctionNode(AST):
-    def __init__(self, name: AST, params: list(), body: AST):
+    def __init__(self, name: AST, params: List[str], body: AST):
         self.name = name
+        self.params = params
         self.body = body
         self.params = params
     def __repr__(self):
-        return f'func {self.name}({self.params}) { {self.body} }'
+        return f'func {self.name} ({self.params}) { {self.body} }'
     def eval(self, state):
-        return state.bind(self.name, self.body)
+        return state.bind(self.name, self)
 
 class Call(AST):
-    def __init__(self, name: str):
+    def __init__(self, name: str, args: List[AST]):
         self.name = name
+        self.args = args
     def __repr__(self):
         return self.name
     def eval(self, state):
         callable_ = state.lookup(self.name)
-        return callable_.eval(state)
 
+        # We need to make a fresh copy of state so that we can safely
+        # bind the argument values to the parameters of the function
+        #
+        # This is necessary so that we don't override existing variable bindings
+        # imagine the following SIO program:
+        #
+        # var x = 10
+        # func foo(x) { x + 12 }
+        # var bar = foo(15) -- x needs to have a value of 15 for evaluation of foo
+        # var j = x  -- x needs to still have a value of 10 here!
+
+        state_copy = State()
+        state_copy.vals = state.vals.copy()
+        if not isinstance(callable_, FunctionNode):
+            callable_ = callable_.eval()
+
+        if isinstance(callable_, FunctionNode):
+            if len(callable_.params) == len(self.args):
+                for (param, arg) in zip(callable_.params, self.args):
+                    # evaluate the argument before binding it
+                    state_copy.bind(param, arg.eval(state))
+                return callable_.body.eval(state_copy)
+            else:
+                raise SyntaxError("Invalid number of args")            
+        else:
+            raise SyntaxError("Can't call a non-function")
+       
 class InputNode(AST):
     def __init__(self, prompt: AST):
         self.prompt = prompt
@@ -374,15 +408,22 @@ class Parser:
     def parse_function(self):
         self.expect(TokenKind.FUNC)
         name = self.expect(TokenKind.IDENT).data
-        code = self.parse_block()
-        return FunctionNode(name, code)
-
-    def parse_call(self):
-        name = self.expect(TokenKind.IDENT).data
         self.expect(TokenKind.LPAREN)
-        self.accept(TokenKind.IDENT)
+        params = []
+        while self.token.kind == TokenKind.IDENT:
+            params.append(self.expect(TokenKind.IDENT).data)
+            self.accept(TokenKind.COMMA)
         self.expect(TokenKind.RPAREN)
-        return Call(name)
+        code = self.parse_block()
+        return FunctionNode(name, params, code)
+
+    def parse_call(self, name):
+        args = []
+        while self.token.kind != TokenKind.RPAREN:
+            args.append(self.parse_term())
+            self.accept(TokenKind.COMMA)
+        self.expect(TokenKind.RPAREN)
+        return Call(name, args)
 
     def parse_string(self):
         data = self.expect(TokenKind.STRING).data
@@ -391,10 +432,11 @@ class Parser:
     def parse_term(self):
         t = self.token.kind
         if t == TokenKind.IDENT:
+            name = self.expect(TokenKind.IDENT).data
             if self.accept(TokenKind.LPAREN):
-                return self.parse_call()
+                return self.parse_call(name)
             else:
-                return self.parse_var()
+                return VarExpr(name)
         elif t == TokenKind.INT:
             return self.parse_num()
         elif t == TokenKind.STRING:
@@ -419,6 +461,8 @@ class Parser:
             return self.parse_file_open()
         elif t == TokenKind.INPUT:
             return self.parse_input()
+        elif t == TokenKind.FUNC:
+            return self.parse_function()
         else:
             return self.parse_operator_expr()
 
